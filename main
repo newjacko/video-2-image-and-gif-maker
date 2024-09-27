@@ -1,0 +1,1609 @@
+import os
+import shutil
+import tempfile
+import threading
+import time
+import zipfile
+import queue
+import platform
+import traceback
+import tkinter as tk
+from tkinter import messagebox, filedialog, colorchooser
+from tkinterdnd2 import DND_FILES, TkinterDnD
+
+import customtkinter as ctk
+import moviepy.editor as mp
+from PIL import Image, ImageTk, ImageEnhance, ImageFilter, ImageOps, ImageDraw, ImageFont
+import imageio
+import imageio_ffmpeg  # Ensure you have imageio-ffmpeg installed
+
+import cv2  # OpenCV for super-resolution
+import numpy as np
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+
+
+class VideoProcessorApp(TkinterDnD.Tk):
+    def __init__(self):
+        super().__init__()
+
+        # Initialize the queue for thread-safe GUI updates
+        self.gui_queue = queue.Queue()
+
+        # Configure CustomTkinter
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("dark-blue")
+
+        self.title("Video Processor")
+        self.geometry("1200x800")
+
+        # Set the background color of the main window
+        self.configure(bg="#212121")
+
+        # Create a custom title bar
+        self.overrideredirect(True)
+        self.create_title_bar()
+
+        # Create GUI elements
+        self.create_widgets()
+
+        # Bind the window close event
+        self.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+        # Start the GUI update loop
+        self.after(100, self.process_gui_queue)
+
+        # Set FFmpeg path dynamically
+        self.set_ffmpeg_path()
+
+    def set_ffmpeg_path(self):
+        # Try to find FFmpeg in PATH
+        ffmpeg_path = shutil.which("ffmpeg")
+        if ffmpeg_path is None:
+            # Not found in PATH, prompt the user to select FFmpeg executable
+            response = messagebox.askyesno(
+                "FFmpeg Not Found",
+                "FFmpeg executable not found. Would you like to locate it manually?",
+            )
+            if response:
+                ffmpeg_path = filedialog.askopenfilename(
+                    title="Select FFmpeg Executable",
+                    filetypes=[("FFmpeg Executable", "ffmpeg.exe" if os.name == 'nt' else "ffmpeg")],
+                )
+                if ffmpeg_path and os.path.exists(ffmpeg_path):
+                    os.environ["IMAGEIO_FFMPEG_EXE"] = ffmpeg_path
+                else:
+                    messagebox.showerror("FFmpeg Required", "FFmpeg is required for video processing. The application will now exit.")
+                    self.destroy()
+            else:
+                messagebox.showerror("FFmpeg Required", "FFmpeg is required for video processing. The application will now exit.")
+                self.destroy()
+        else:
+            os.environ["IMAGEIO_FFMPEG_EXE"] = ffmpeg_path
+
+    def process_gui_queue(self):
+        try:
+            while True:
+                func, args = self.gui_queue.get_nowait()
+                func(*args)
+        except queue.Empty:
+            pass
+        self.after(100, self.process_gui_queue)
+
+    def create_title_bar(self):
+        # Title bar frame
+        self.title_bar = ctk.CTkFrame(self, height=30, fg_color="#212121")
+        self.title_bar.pack(fill="x", side="top")
+
+        # Title label
+        self.title_label = ctk.CTkLabel(
+            self.title_bar, text="Video Processor", anchor="w", text_color="white"
+        )
+        self.title_label.pack(side="left", padx=10, pady=5)
+
+        # Button frame for close, minimize, maximize
+        self.button_frame = ctk.CTkFrame(self.title_bar, fg_color="#212121")
+        self.button_frame.pack(side="right", padx=10)
+
+        # Minimize button
+        self.minimize_button = ctk.CTkButton(
+            self.button_frame,
+            width=20,
+            height=20,
+            text="–",
+            text_color="black",
+            fg_color="#43A047",  # Green
+            hover_color="#66BB6A",
+            corner_radius=10,
+            command=self.minimize_window,
+        )
+        self.minimize_button.pack(side="left", padx=5)
+
+        # Maximize button
+        self.maximize_button = ctk.CTkButton(
+            self.button_frame,
+            width=20,
+            height=20,
+            text="⬜",
+            text_color="black",
+            fg_color="#FFEB3B",  # Yellow
+            hover_color="#FFEE58",
+            corner_radius=10,
+            command=self.toggle_maximize,
+        )
+        self.maximize_button.pack(side="left", padx=5)
+
+        # Close button
+        self.close_button = ctk.CTkButton(
+            self.button_frame,
+            width=20,
+            height=20,
+            text="✕",
+            text_color="black",
+            fg_color="#E53935",  # Red
+            hover_color="#EF5350",
+            corner_radius=10,
+            command=self.close_window,
+        )
+        self.close_button.pack(side="left", padx=5)
+
+        # Enable window dragging
+        self.title_bar.bind("<B1-Motion>", self.move_window)
+        self.title_bar.bind("<Button-1>", self.get_pos)
+
+    def minimize_window(self):
+        self.update_idletasks()
+        self.overrideredirect(False)
+        self.state('iconic')
+        self.bind("<Map>", self.restore_window)
+
+    def restore_window(self, event):
+        self.overrideredirect(True)
+        self.unbind("<Map>")
+
+    def toggle_maximize(self):
+        if self.state() == "zoomed":
+            self.state("normal")
+        else:
+            self.state("zoomed")
+
+    def close_window(self):
+        self.destroy()
+
+    def get_pos(self, event):
+        self.xwin = event.x
+        self.ywin = event.y
+
+    def move_window(self, event):
+        x = (event.x_root - self.xwin)
+        y = (event.y_root - self.ywin)
+        self.geometry(f'+{x}+{y}')
+
+    def create_widgets(self):
+        # Main Frame
+        self.main_frame = ctk.CTkFrame(self, fg_color="#212121")
+        self.main_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        # Create a tab view
+        self.tabview = ctk.CTkTabview(self.main_frame)
+        self.tabview.pack(fill="both", expand=True, padx=10, pady=10)
+
+        # Create tabs
+        self.video_tab = self.tabview.add("Video Frame Extractor")
+        self.gif_tab = self.tabview.add("GIF Generator")
+
+        # Create widgets for each tab
+        self.video_frame_extractor = VideoFrameExtractor(self.video_tab, self.gui_queue)
+        self.video_frame_extractor.pack(fill="both", expand=True)
+
+        self.gif_generator = GIFGeneratorTab(self.gif_tab, self.gui_queue)
+        self.gif_generator.pack(fill="both", expand=True)
+
+    def on_closing(self):
+        self.destroy()
+
+
+class VideoFrameExtractor(ctk.CTkFrame):
+    def __init__(self, parent, gui_queue):
+        super().__init__(parent)
+        self.gui_queue = gui_queue
+
+        # Initialize variables
+        self.video_path = ""
+        self.output_folder = ""
+        self.clip = None
+        self.video_length = 0
+        self.start_time = 0
+        self.end_time = 0
+        self.export_format = ctk.StringVar(value="PNG")
+        self.enhance_option = ctk.StringVar(value="None")
+        self.output_size = ctk.StringVar(value="Original Size")
+        self.manual_width = tk.IntVar(value=0)
+        self.manual_height = tk.IntVar(value=0)
+
+        # Initialize crop variables
+        self.crop_rect = None  # Stores the cropping rectangle (x0, y0, x1, y1)
+        self.is_drawing = False  # Flag to track if the user is drawing a rectangle
+
+        # Initialize super-resolution model
+        self.sr = None
+        self.load_super_resolution_model()
+
+        # Create GUI elements
+        self.create_widgets()
+
+    def load_super_resolution_model(self):
+        try:
+            self.sr = cv2.dnn_superres.DnnSuperResImpl_create()
+            # Provide the path to your EDSR model file
+            model_path = os.path.join(os.path.dirname(__file__), "EDSR_x4.pb")  # Change this path if necessary
+            if not os.path.exists(model_path):
+                messagebox.showerror("Model Not Found", f"Super-resolution model file '{model_path}' not found.")
+                self.enhance_option.set("None")
+                self.sr = None  # Ensure sr is None
+                return
+            self.sr.readModel(model_path)
+            self.sr.setModel('edsr', 4)  # Using EDSR model with scale factor x4
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load super-resolution model: {e}")
+            self.enhance_option.set("None")
+            self.sr = None  # Ensure sr is None
+
+    def create_widgets(self):
+        # Left Frame for controls
+        self.left_frame = ctk.CTkFrame(self, fg_color="#212121")
+        self.left_frame.pack(side="left", fill="y", padx=5, pady=5)
+
+        # Right Frame for video preview
+        self.right_frame = ctk.CTkFrame(self, fg_color="#212121")
+        self.right_frame.pack(side="left", fill="both", expand=True, padx=5, pady=5)
+
+        # Instruction label
+        self.label = ctk.CTkLabel(
+            self.left_frame,
+            text="Drag and drop a video file here\nSupported formats: .mp4, .avi, .mov, .mkv, etc.",
+            justify="center",
+        )
+        self.label.pack(pady=10)
+
+        # Drag-and-drop frame
+        self.drop_frame = ctk.CTkFrame(
+            self.left_frame,
+            width=200,
+            height=50,
+            border_width=2,
+            corner_radius=5,
+        )
+        self.drop_frame.pack(pady=10)
+        self.drop_frame.pack_propagate(False)
+
+        # Label inside the drop frame
+        ctk.CTkLabel(
+            self.drop_frame,
+            text="Drop video here",
+            justify="center",
+        ).pack(expand=True)
+
+        # Enable drag and drop
+        self.drop_frame.drop_target_register(DND_FILES)
+        self.drop_frame.dnd_bind("<<Drop>>", self.drop_event)
+
+        # Select Video File button and label
+        self.select_video_frame = ctk.CTkFrame(self.left_frame, fg_color="#212121")
+        self.select_video_frame.pack(pady=5, fill="x")
+
+        self.select_video_button = ctk.CTkButton(
+            self.select_video_frame,
+            text="Select Video File",
+            command=self.select_video_file,
+        )
+        self.select_video_button.pack(side="left", padx=5)
+
+        self.selected_video_label = ctk.CTkLabel(
+            self.select_video_frame,
+            text="No file selected",
+            anchor="w",
+        )
+        self.selected_video_label.pack(side="left", padx=5)
+
+        # Select Output Folder button and label
+        self.output_frame = ctk.CTkFrame(self.left_frame, fg_color="#212121")
+        self.output_frame.pack(pady=5, fill="x")
+
+        self.output_button = ctk.CTkButton(
+            self.output_frame,
+            text="Select Output Folder",
+            command=self.select_output_folder,
+        )
+        self.output_button.pack(side="left", padx=5)
+
+        self.selected_output_label = ctk.CTkLabel(
+            self.output_frame,
+            text="No folder selected",
+            anchor="w",
+        )
+        self.selected_output_label.pack(side="left", padx=5)
+
+        # Clear All Button
+        self.clear_button = ctk.CTkButton(
+            self.left_frame,
+            text="Clear All",
+            command=self.clear_all,
+            fg_color="#f44336",
+        )
+        self.clear_button.pack(pady=5)
+
+        # Copy File Location Button
+        self.copy_button = ctk.CTkButton(
+            self.left_frame,
+            text="Copy File Location",
+            command=self.copy_file_location,
+            fg_color="#FF9800",
+        )
+        self.copy_button.pack(pady=5)
+
+        # Video Controls Frame
+        self.controls_frame = ctk.CTkFrame(self.left_frame, fg_color="#212121")
+        self.controls_frame.pack(pady=10)
+
+        # Start Time Label and Entry
+        self.start_label = ctk.CTkLabel(
+            self.controls_frame,
+            text="Start Time (s):",
+        )
+        self.start_label.grid(row=0, column=0, padx=5, pady=5, sticky="e")
+        self.start_entry = ctk.CTkEntry(
+            self.controls_frame, width=100
+        )
+        self.start_entry.grid(row=0, column=1, padx=5, pady=5)
+        self.start_entry.insert(0, "0")
+
+        # Set Start Time Button
+        self.set_start_button = ctk.CTkButton(
+            self.controls_frame,
+            text="Set Start Time",
+            command=self.set_start_time,
+            width=120,
+        )
+        self.set_start_button.grid(row=0, column=2, padx=5, pady=5)
+
+        # End Time Label and Entry
+        self.end_label = ctk.CTkLabel(
+            self.controls_frame,
+            text="End Time (s):",
+        )
+        self.end_label.grid(row=1, column=0, padx=5, pady=5, sticky="e")
+        self.end_entry = ctk.CTkEntry(self.controls_frame, width=100)
+        self.end_entry.grid(row=1, column=1, padx=5, pady=5)
+        self.end_entry.insert(0, "0")
+
+        # Set End Time Button
+        self.set_end_button = ctk.CTkButton(
+            self.controls_frame,
+            text="Set End Time",
+            command=self.set_end_time,
+            width=120,
+        )
+        self.set_end_button.grid(row=1, column=2, padx=5, pady=5)
+
+        # Frame Interval Label and Entry
+        self.interval_label = ctk.CTkLabel(
+            self.controls_frame,
+            text="Frame Interval (s):",
+        )
+        self.interval_label.grid(row=2, column=0, padx=5, pady=5, sticky="e")
+        self.interval_entry = ctk.CTkEntry(
+            self.controls_frame, width=100
+        )
+        self.interval_entry.grid(row=2, column=1, padx=5, pady=5)
+        self.interval_entry.insert(0, "0.25")
+
+        # Image Enhancement Options
+        self.enhance_label = ctk.CTkLabel(
+            self.controls_frame,
+            text="Enhancement:",
+        )
+        self.enhance_label.grid(row=3, column=0, padx=5, pady=5, sticky="ne")
+
+        self.enhance_options_frame = ctk.CTkFrame(self.controls_frame, fg_color="#212121")
+        self.enhance_options_frame.grid(
+            row=3, column=1, columnspan=2, padx=5, pady=5, sticky="w"
+        )
+
+        # Arrange enhancement options
+        self.enhance_none = ctk.CTkRadioButton(
+            self.enhance_options_frame,
+            text="None",
+            variable=self.enhance_option,
+            value="None",
+        )
+        self.enhance_none.grid(row=0, column=0, padx=5, pady=2, sticky="w")
+
+        self.enhance_exposure = ctk.CTkRadioButton(
+            self.enhance_options_frame,
+            text="Exposure",
+            variable=self.enhance_option,
+            value="Exposure",
+        )
+        self.enhance_exposure.grid(row=0, column=1, padx=5, pady=2, sticky="w")
+
+        self.enhance_resize = ctk.CTkRadioButton(
+            self.enhance_options_frame,
+            text="2x Resize",
+            variable=self.enhance_option,
+            value="Resize",
+        )
+        self.enhance_resize.grid(row=0, column=2, padx=5, pady=2, sticky="w")
+
+        self.enhance_sr = ctk.CTkRadioButton(
+            self.enhance_options_frame,
+            text="Super-Resolution",
+            variable=self.enhance_option,
+            value="Super-Resolution",
+        )
+        self.enhance_sr.grid(row=1, column=0, padx=5, pady=2, sticky="w")
+
+        self.enhance_bw = ctk.CTkRadioButton(
+            self.enhance_options_frame,
+            text="Black and White",
+            variable=self.enhance_option,
+            value="Black and White",
+        )
+        self.enhance_bw.grid(row=1, column=1, padx=5, pady=2, sticky="w")
+
+        self.enhance_vintage = ctk.CTkRadioButton(
+            self.enhance_options_frame,
+            text="Vintage",
+            variable=self.enhance_option,
+            value="Vintage",
+        )
+        self.enhance_vintage.grid(row=1, column=2, padx=5, pady=2, sticky="w")
+
+        self.enhance_vangogh = ctk.CTkRadioButton(
+            self.enhance_options_frame,
+            text="Vincent van Gogh",
+            variable=self.enhance_option,
+            value="Vincent van Gogh",
+        )
+        self.enhance_vangogh.grid(row=2, column=0, padx=5, pady=2, sticky="w")
+
+        # Export Format Options
+        self.format_label = ctk.CTkLabel(
+            self.controls_frame,
+            text="Export Format:",
+        )
+        self.format_label.grid(row=4, column=0, padx=5, pady=5, sticky="e")
+
+        self.format_menu = ctk.CTkOptionMenu(
+            self.controls_frame,
+            variable=self.export_format,
+            values=["PNG", "JPEG", "WEBP", "GIF"],
+            width=100,
+        )
+        self.format_menu.grid(row=4, column=1, padx=5, pady=5, sticky="w")
+        self.format_menu.set("PNG")
+
+        # Output Size Options
+        self.size_label = ctk.CTkLabel(
+            self.controls_frame,
+            text="Output Size:",
+        )
+        self.size_label.grid(row=5, column=0, padx=5, pady=5, sticky="ne")
+
+        self.size_options_frame = ctk.CTkFrame(self.controls_frame, fg_color="#212121")
+        self.size_options_frame.grid(row=5, column=1, columnspan=2, padx=5, pady=5, sticky="w")
+
+        self.size_menu = ctk.CTkOptionMenu(
+            self.size_options_frame,
+            variable=self.output_size,
+            values=["Original Size", "16:9 Aspect Ratio", "Instagram Size (1080x608)", "Manual Size"],
+            width=150,
+            command=self.toggle_manual_size_entries
+        )
+        self.size_menu.grid(row=0, column=0, padx=5, pady=5, sticky="w")
+        self.size_menu.set("Original Size")
+
+        # Manual Width and Height Entries
+        self.manual_size_frame = ctk.CTkFrame(self.size_options_frame, fg_color="#212121")
+        self.manual_size_frame.grid(row=1, column=0, padx=5, pady=5, sticky="w")
+
+        self.manual_width_label = ctk.CTkLabel(self.manual_size_frame, text="Width:")
+        self.manual_width_label.grid(row=0, column=0, padx=5, pady=2, sticky="e")
+        self.manual_width_entry = ctk.CTkEntry(self.manual_size_frame, width=80)
+        self.manual_width_entry.grid(row=0, column=1, padx=5, pady=2)
+        self.manual_width_entry.insert(0, "0")
+
+        self.manual_height_label = ctk.CTkLabel(self.manual_size_frame, text="Height:")
+        self.manual_height_label.grid(row=0, column=2, padx=5, pady=2, sticky="e")
+        self.manual_height_entry = ctk.CTkEntry(self.manual_size_frame, width=80)
+        self.manual_height_entry.grid(row=0, column=3, padx=5, pady=2)
+        self.manual_height_entry.insert(0, "0")
+
+        # Initially hide manual size entries
+        self.toggle_manual_size_entries("Original Size")
+
+        # Video Preview Area in the right frame
+        self.preview_label = ctk.CTkLabel(
+            self.right_frame,
+            text="Video Preview:",
+        )
+        self.preview_label.pack(pady=5)
+
+        # Use standard tkinter Canvas
+        self.video_canvas = tk.Canvas(self.right_frame, bg="black", cursor="cross")
+        self.video_canvas.pack(pady=5, fill="both", expand=True)
+
+        # Bind mouse events for cropping
+        self.video_canvas.bind("<ButtonPress-1>", self.start_crop)
+        self.video_canvas.bind("<B1-Motion>", self.draw_crop_rectangle)
+        self.video_canvas.bind("<ButtonRelease-1>", self.end_crop)
+
+        # Video Scrubber Scale
+        self.video_scrubber = ctk.CTkSlider(
+            self.right_frame,
+            from_=0,
+            to=0,
+            command=self.scrub_video,
+        )
+        self.video_scrubber.pack(pady=5, fill="x", padx=10)
+        self.video_scrubber_label = ctk.CTkLabel(
+            self.right_frame,
+            text="0.00 s",
+        )
+        self.video_scrubber_label.pack()
+
+        # Process Button
+        self.process_button = ctk.CTkButton(
+            self.right_frame,
+            text="Process",
+            command=self.process_video,
+        )
+        self.process_button.pack(pady=(10, 5), side="left", anchor="w", padx=10)
+
+        # Progress Bar at the bottom
+        self.bottom_progress = ctk.CTkProgressBar(
+            self, orientation="horizontal", width=1100
+        )
+        self.bottom_progress.pack(pady=10)
+        self.bottom_progress.set(0)
+
+        # Status Label
+        self.status_label = ctk.CTkLabel(
+            self,
+            text="No processing started.",
+            wraplength=1100,
+            justify="center",
+        )
+        self.status_label.pack(pady=10)
+
+    def toggle_manual_size_entries(self, selection):
+        if selection == "Manual Size":
+            self.manual_size_frame.grid()
+        else:
+            self.manual_size_frame.grid_remove()
+            # Reset manual width and height entries
+            self.manual_width_entry.delete(0, tk.END)
+            self.manual_width_entry.insert(0, "0")
+            self.manual_height_entry.delete(0, tk.END)
+            self.manual_height_entry.insert(0, "0")
+
+    def start_crop(self, event):
+        if not self.clip:
+            return
+        self.is_drawing = True
+        self.crop_rect = (event.x, event.y, event.x, event.y)
+        self.video_canvas.delete("crop_rectangle")
+
+    def draw_crop_rectangle(self, event):
+        if not self.is_drawing:
+            return
+        x0, y0, _, _ = self.crop_rect
+        x1, y1 = event.x, event.y
+        self.crop_rect = (x0, y0, x1, y1)
+        self.video_canvas.delete("crop_rectangle")
+        self.video_canvas.create_rectangle(x0, y0, x1, y1, outline="red", width=2, tags="crop_rectangle")
+
+    def end_crop(self, event):
+        if not self.is_drawing:
+            return
+        self.is_drawing = False
+        x0, y0, x1, y1 = self.crop_rect
+        self.crop_rect = (x0, y0, x1, y1)
+        self.status_label.configure(text="Crop area selected.")
+
+    def drop_event(self, event):
+        file_path = event.data.strip("{}")  # Remove braces if any
+        if os.path.isfile(file_path):
+            if self.is_video_file(file_path):
+                self.video_path = file_path
+                self.selected_video_label.configure(text=os.path.basename(self.video_path))
+                self.load_video()
+            else:
+                messagebox.showerror(
+                    "Invalid File",
+                    "Please select a valid video file (e.g., .mp4, .avi, .mov).",
+                )
+        else:
+            messagebox.showerror("Invalid Selection", "The dropped item is not a file.")
+
+    def select_video_file(self):
+        file_path = filedialog.askopenfilename(
+            title="Select Video File",
+            filetypes=[
+                ("Video Files", "*.mp4 *.avi *.mov *.mkv *.flv *.wmv *.mpeg *.mpg"),
+                ("All Files", "*.*"),
+            ],
+        )
+        if file_path and self.is_video_file(file_path):
+            self.video_path = file_path
+            self.selected_video_label.configure(text=os.path.basename(self.video_path))
+            self.load_video()
+        else:
+            messagebox.showerror("Invalid File", "Please select a valid video file.")
+
+    def is_video_file(self, filepath):
+        video_extensions = [
+            ".mp4",
+            ".avi",
+            ".mov",
+            ".mkv",
+            ".flv",
+            ".wmv",
+            ".mpeg",
+            ".mpg",
+        ]
+        _, ext = os.path.splitext(filepath)
+        return ext.lower() in video_extensions
+
+    def select_output_folder(self):
+        self.output_folder = filedialog.askdirectory()
+        if self.output_folder:
+            self.selected_output_label.configure(text=os.path.basename(self.output_folder))
+            self.status_label.configure(
+                text=f"Output folder selected: {self.output_folder}"
+            )
+        else:
+            self.status_label.configure(text="No output folder selected.")
+
+    def load_video(self):
+        try:
+            # Load video with MoviePy
+            self.clip = mp.VideoFileClip(self.video_path)
+            self.video_length = self.clip.duration
+            self.start_entry.delete(0, tk.END)
+            self.start_entry.insert(0, "0")
+            self.end_entry.delete(0, tk.END)
+            self.end_entry.insert(0, f"{self.video_length:.2f}")
+            self.status_label.configure(
+                text=f"Video loaded: {os.path.basename(self.video_path)}\nDuration: {self.video_length:.2f} seconds, Resolution: {self.clip.w}x{self.clip.h}"
+            )
+
+            # Adjust video canvas size to maintain aspect ratio
+            self.update_preview_dimensions()
+
+            # Update video scrubber
+            self.video_scrubber.configure(to=self.video_length)
+            self.video_scrubber.set(0)
+
+            # Display the first frame
+            self.scrub_video(0)
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load video: {e}")
+
+    def update_preview_dimensions(self):
+        max_preview_width = 640
+        max_preview_height = 360
+
+        video_width = self.clip.w
+        video_height = self.clip.h
+
+        # Determine desired aspect ratio based on selected output size
+        size_option = self.output_size.get()
+        if size_option == "16:9 Aspect Ratio":
+            desired_aspect_ratio = 16 / 9
+        elif size_option == "Instagram Size (1080x608)":
+            desired_aspect_ratio = 1080 / 608
+        elif size_option == "Manual Size":
+            try:
+                manual_width = int(self.manual_width_entry.get())
+                manual_height = int(self.manual_height_entry.get())
+                if manual_width <= 0 or manual_height <= 0:
+                    raise ValueError
+                desired_aspect_ratio = manual_width / manual_height
+            except ValueError:
+                messagebox.showerror("Invalid Size", "Please enter valid manual width and height.")
+                desired_aspect_ratio = video_width / video_height  # Fallback to original
+        else:  # Original Size
+            desired_aspect_ratio = video_width / video_height
+
+        # Adjust preview size while maintaining aspect ratio
+        if desired_aspect_ratio >= 1:
+            preview_width = min(max_preview_width, int(max_preview_height * desired_aspect_ratio))
+            preview_height = min(max_preview_height, int(preview_width / desired_aspect_ratio))
+        else:
+            preview_height = min(max_preview_height, int(max_preview_width / desired_aspect_ratio))
+            preview_width = min(max_preview_width, int(preview_height * desired_aspect_ratio))
+
+        self.preview_width = preview_width
+        self.preview_height = preview_height
+
+        self.video_canvas.config(width=self.preview_width, height=self.preview_height)
+
+    def scrub_video(self, val):
+        if self.clip:
+            t = float(val)
+            self.video_scrubber_label.configure(text=f"{t:.2f} s")
+            try:
+                frame = self.clip.get_frame(t)
+                img = Image.fromarray(frame)
+                # Adjust the image size and add black bars if necessary
+                img = self.prepare_image(img, preview=True)
+
+                imgtk = ImageTk.PhotoImage(image=img)
+                self.video_canvas.create_image(0, 0, anchor="nw", image=imgtk)
+                self.video_canvas.image = imgtk
+                # Redraw crop rectangle if it exists
+                if self.crop_rect:
+                    self.video_canvas.create_rectangle(*self.crop_rect, outline="red", width=2, tags="crop_rectangle")
+            except Exception as e:
+                self.status_label.configure(
+                    text=f"Error displaying frame at {t:.2f} seconds: {e}"
+                )
+
+    def set_start_time(self):
+        val = self.video_scrubber.get()
+        self.start_entry.delete(0, tk.END)
+        self.start_entry.insert(0, f"{val:.2f}")
+        self.status_label.configure(text=f"Start time set to {val:.2f} seconds")
+
+    def set_end_time(self):
+        val = self.video_scrubber.get()
+        self.end_entry.delete(0, tk.END)
+        self.end_entry.insert(0, f"{val:.2f}")
+        self.status_label.configure(text=f"End time set to {val:.2f} seconds")
+
+    def process_video(self):
+        if not self.video_path:
+            messagebox.showerror("Error", "No video file selected!")
+            return
+        if not self.output_folder:
+            messagebox.showerror("Error", "No output folder selected!")
+            return
+
+        # Validate manual width and height if selected
+        if self.output_size.get() == "Manual Size":
+            try:
+                manual_width = int(self.manual_width_entry.get())
+                manual_height = int(self.manual_height_entry.get())
+                if manual_width <= 0 or manual_height <= 0:
+                    raise ValueError
+                self.manual_width.set(manual_width)
+                self.manual_height.set(manual_height)
+            except ValueError:
+                messagebox.showerror("Invalid Size", "Please enter valid manual width and height.")
+                return
+
+        try:
+            self.start_time = float(self.start_entry.get())
+            self.end_time = float(self.end_entry.get())
+            frame_interval = float(self.interval_entry.get())
+
+            if (
+                self.start_time < 0
+                or self.end_time > self.video_length
+                or self.start_time >= self.end_time
+            ):
+                messagebox.showerror(
+                    "Invalid Time Range",
+                    "Please enter a valid start and end time within the video duration.",
+                )
+                return
+            if frame_interval <= 0:
+                messagebox.showerror(
+                    "Invalid Interval", "Frame interval must be a positive number."
+                )
+                return
+
+        except ValueError:
+            messagebox.showerror(
+                "Invalid Input",
+                "Please enter valid numerical values for times and interval.",
+            )
+            return
+
+        # Disable the process button to prevent multiple clicks
+        self.process_button.configure(state="disabled")
+
+        # Reset bottom progress bar
+        self.bottom_progress.set(0)
+
+        # Start processing in a separate thread
+        processing_thread = threading.Thread(target=self.extract_frames, daemon=True)
+        processing_thread.start()
+
+    def prepare_image(self, img, preview=False):
+        # Crop the image using the selected rectangle
+        if self.crop_rect:
+            x0, y0, x1, y1 = self.crop_rect
+            # Adjust coordinates to the original image size
+            img_width, img_height = img.size
+            canvas_width, canvas_height = self.video_canvas.winfo_width(), self.video_canvas.winfo_height()
+            scale_x = img_width / canvas_width
+            scale_y = img_height / canvas_height
+            left = int(min(x0, x1) * scale_x)
+            upper = int(min(y0, y1) * scale_y)
+            right = int(max(x0, x1) * scale_x)
+            lower = int(max(y0, y1) * scale_y)
+            img = img.crop((left, upper, right, lower))
+
+        # Proceed with resizing and enhancements as before
+        # Determine desired output size
+        size_option = self.output_size.get()
+        original_width, original_height = img.size
+
+        if size_option == "16:9 Aspect Ratio":
+            target_width = original_width
+            target_height = int(original_width * 9 / 16)
+            maintain_aspect_ratio = True
+        elif size_option == "Instagram Size (1080x608)":
+            target_width, target_height = 1080, 608
+            maintain_aspect_ratio = True
+        elif size_option == "Manual Size":
+            try:
+                manual_width = int(self.manual_width_entry.get())
+                manual_height = int(self.manual_height_entry.get())
+                if manual_width <= 0 or manual_height <= 0:
+                    raise ValueError
+                target_width, target_height = manual_width, manual_height
+                maintain_aspect_ratio = False  # Stretch to fit
+            except ValueError:
+                messagebox.showerror("Invalid Size", "Please enter valid manual width and height.")
+                target_width, target_height = original_width, original_height
+                maintain_aspect_ratio = True  # Fallback to original
+        else:  # Original Size
+            target_width, target_height = original_width, original_height
+            maintain_aspect_ratio = True
+
+        if maintain_aspect_ratio:
+            # Resize image while maintaining aspect ratio
+            img_ratio = original_width / original_height
+            target_ratio = target_width / target_height
+
+            if img_ratio > target_ratio:
+                # Image is wider than target aspect ratio
+                new_width = min(target_width, original_width)
+                new_height = int(new_width / img_ratio)
+            else:
+                # Image is taller than target aspect ratio
+                new_height = min(target_height, original_height)
+                new_width = int(new_height * img_ratio)
+
+            img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+
+            # Create new image with black background
+            new_img = Image.new("RGB", (target_width, target_height), (0, 0, 0))
+            paste_x = (target_width - new_width) // 2
+            paste_y = (target_height - new_height) // 2
+            new_img.paste(img, (paste_x, paste_y))
+        else:
+            # Stretch to fit the target dimensions
+            new_img = img.resize((target_width, target_height), Image.Resampling.LANCZOS)
+
+        # Apply enhancement if selected (except 'Resize' and 'Super-Resolution')
+        if self.enhance_option.get() == "Exposure":
+            enhancer = ImageEnhance.Brightness(new_img)
+            new_img = enhancer.enhance(1.5)  # Increase brightness by 50%
+        elif self.enhance_option.get() == "Black and White":
+            new_img = new_img.convert("L").convert("RGB")
+        elif self.enhance_option.get() == "Vintage":
+            new_img = new_img.convert("L")
+            new_img = ImageOps.colorize(new_img, black="#704214", white="#C0A080")
+        elif self.enhance_option.get() == "Vincent van Gogh":
+            new_img = new_img.filter(ImageFilter.DETAIL)
+            new_img = new_img.filter(ImageFilter.EDGE_ENHANCE_MORE)
+            new_img = new_img.filter(ImageFilter.EMBOSS)
+
+        # Apply 'Resize' enhancement if selected
+        if self.enhance_option.get() == "Resize":
+            new_img = new_img.resize((new_img.width * 2, new_img.height * 2), Image.Resampling.LANCZOS)
+
+        # Apply 'Super-Resolution' enhancement if selected
+        if self.enhance_option.get() == "Super-Resolution" and self.sr:
+            # Convert PIL Image to OpenCV format
+            img_cv = cv2.cvtColor(np.array(new_img), cv2.COLOR_RGB2BGR)
+            # Apply super-resolution
+            result = self.sr.upsample(img_cv)
+            # Convert back to PIL Image
+            new_img = Image.fromarray(cv2.cvtColor(result, cv2.COLOR_BGR2RGB))
+
+        # For preview, resize to fit preview dimensions
+        if preview:
+            new_img = new_img.resize((self.preview_width, self.preview_height), Image.Resampling.LANCZOS)
+
+        return new_img
+
+    def extract_frames(self):
+        try:
+            self.status_label.configure(text=f"Processing video: {self.video_path}")
+
+            # Open video file with MoviePy
+            with mp.VideoFileClip(self.video_path).subclip(self.start_time, self.end_time) as clip:
+                duration = clip.duration
+                width, height = clip.size
+                self.status_label.configure(text=f"Video resolution: {width}x{height}\nDuration: {duration:.2f} seconds")
+
+                frame_interval = float(self.interval_entry.get())
+
+                # Calculate total frames
+                times = [i for i in self.frange(0, duration, frame_interval)]
+                total_frames = len(times)
+
+                # Reset progress bar
+                self.bottom_progress.set(0)
+
+                # Use system temporary directory
+                temp_dir = os.path.join(tempfile.gettempdir(), "temp_frames")
+                os.makedirs(temp_dir, exist_ok=True)
+
+                # Update status
+                self.status_label.configure(text="Extracting frames...")
+
+                export_fmt = self.export_format.get()
+
+                for idx, t in enumerate(times):
+                    frame_time = self.start_time + t
+                    frame = clip.get_frame(t)
+                    img = Image.fromarray(frame)
+
+                    # Prepare image (crop, resize, add black bars, apply enhancements)
+                    img = self.prepare_image(img)
+
+                    # Save frame
+                    image_path = os.path.join(
+                        temp_dir, f"frame_{idx:05d}_{frame_time:.2f}.{export_fmt.lower()}"
+                    )
+                    if export_fmt == "JPEG":
+                        img.save(image_path, format="JPEG", quality=95)
+                    elif export_fmt == "WEBP":
+                        img.save(image_path, format="WEBP", quality=95)
+                    elif export_fmt == "GIF":
+                        img.save(image_path, format="GIF")
+                    else:
+                        img.save(image_path, format="PNG", compress_level=0)
+
+                    # Update progress bar
+                    progress = (idx + 1) / total_frames
+                    self.bottom_progress.set(progress)
+
+                    # Update status every frame
+                    self.status_label.configure(text=f"Extracting frame at {frame_time:.2f} seconds... ({idx + 1}/{total_frames})")
+
+                # Update status
+                self.status_label.configure(text="Creating ZIP file...")
+
+                # Create zip file
+                zip_path = self.create_zip(temp_dir, export_fmt)
+
+                # Cleanup temp directory
+                shutil.rmtree(temp_dir)
+
+                # Update status
+                self.status_label.configure(text=f"Done! Frames saved to {zip_path}")
+
+                messagebox.showinfo("Success", f"Frames extracted and zipped successfully!\nSaved to: {zip_path}")
+
+            # Re-enable the process button
+            self.process_button.configure(state="normal")
+
+        except Exception as e:
+            traceback.print_exc()
+            messagebox.showerror("Error", f"An error occurred: {e}")
+            # Re-enable the process button
+            self.process_button.configure(state="normal")
+
+    def create_zip(self, directory, export_fmt):
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        zip_filename = os.path.join(self.output_folder, f"video_frames_{timestamp}.zip")
+
+        # Ensure output folder exists
+        if not os.path.isdir(self.output_folder):
+            raise FileNotFoundError(
+                f"Output folder does not exist: {self.output_folder}"
+            )
+
+        # Check if there are files to zip
+        files_to_zip = []
+        for root, _, files in os.walk(directory):
+            for file in files:
+                if file.lower().endswith(export_fmt.lower()):
+                    filepath = os.path.join(root, file)
+                    arcname = os.path.relpath(filepath, directory)
+                    files_to_zip.append((filepath, arcname))
+
+        if not files_to_zip:
+            raise ValueError("No frames were extracted to create the ZIP file.")
+
+        with zipfile.ZipFile(
+            zip_filename, "w", compression=zipfile.ZIP_DEFLATED
+        ) as zipf:
+            for filepath, arcname in files_to_zip:
+                zipf.write(filepath, arcname)
+
+        return zip_filename
+
+    def frange(self, start, stop, step):
+        i = start
+        while i < stop:
+            yield i
+            i += step
+
+    def clear_all(self):
+        # Clear all input fields
+        self.start_entry.delete(0, tk.END)
+        self.start_entry.insert(0, "0")
+        self.end_entry.delete(0, tk.END)
+        self.end_entry.insert(0, "0")
+        self.interval_entry.delete(0, tk.END)
+        self.interval_entry.insert(0, "0.25")
+        self.enhance_option.set("None")
+        self.export_format.set("PNG")
+        self.format_menu.set("PNG")
+        self.output_size.set("Original Size")
+        self.size_menu.set("Original Size")
+        self.toggle_manual_size_entries("Original Size")
+        self.manual_width_entry.delete(0, tk.END)
+        self.manual_width_entry.insert(0, "0")
+        self.manual_height_entry.delete(0, tk.END)
+        self.manual_height_entry.insert(0, "0")
+
+        # Reset crop rectangle
+        self.crop_rect = None
+        self.video_canvas.delete("crop_rectangle")
+
+        # Reset video scrubber
+        if self.clip:
+            self.video_scrubber.configure(to=self.video_length)
+            self.video_scrubber.set(0)
+            self.scrub_video(0)
+
+        # Clear selected file labels
+        self.selected_video_label.configure(text="No file selected")
+        self.selected_output_label.configure(text="No folder selected")
+
+        # Update status
+        self.status_label.configure(text="All fields have been cleared.")
+
+    def copy_file_location(self):
+        if self.video_path:
+            self.clipboard_clear()
+            self.clipboard_append(self.video_path)
+            self.update()
+            messagebox.showinfo("Copied", "Video file location copied to clipboard.")
+        else:
+            messagebox.showerror("Error", "No video file selected to copy.")
+
+
+class GIFGeneratorTab(ctk.CTkFrame):
+    def __init__(self, parent, gui_queue):
+        super().__init__(parent, fg_color="#212121")
+        self.parent = parent
+        self.gui_queue = gui_queue
+
+        # Initialize variables
+        self.image_paths = []
+        self.frame_duration = tk.DoubleVar(value=0.2)  # Default duration in seconds
+        self.apply_circular_crop = tk.BooleanVar(value=False)
+        self.text_overlay = tk.StringVar(value="")
+        self.text_position = [0, 0]  # Initial position of the text
+        self.font_color = "#FFFFFF"  # Default font color: White
+        self.font_size = tk.IntVar(value=24)  # Default font size
+        self.font_name = "Arial"  # Default font name
+
+        # Create tab widgets
+        self.create_widgets()
+
+    def create_widgets(self):
+        # Instruction label
+        self.label = ctk.CTkLabel(
+            self,
+            text="Select the images to create a GIF",
+            justify="center",
+        )
+        self.label.pack(pady=10)
+
+        # Select Images button and label
+        self.select_images_frame = ctk.CTkFrame(self, fg_color="#212121")
+        self.select_images_frame.pack(pady=5, fill="x")
+
+        self.select_images_button = ctk.CTkButton(
+            self.select_images_frame,
+            text="Select Images",
+            command=self.select_images,
+        )
+        self.select_images_button.pack(side="left", padx=5)
+
+        self.selected_images_label = ctk.CTkLabel(
+            self.select_images_frame,
+            text="No images selected",
+            anchor="w",
+        )
+        self.selected_images_label.pack(side="left", padx=5)
+
+        # GIF Speed Slider
+        self.speed_frame = ctk.CTkFrame(self, fg_color="#212121")
+        self.speed_frame.pack(pady=5, fill="x")
+
+        self.speed_label = ctk.CTkLabel(self.speed_frame, text="Adjust GIF Speed:")
+        self.speed_label.pack(side="left", padx=5)
+
+        self.speed_slider = ctk.CTkSlider(
+            self.speed_frame,
+            from_=50,
+            to=1000,
+            orientation='horizontal',
+            command=self.update_speed_label,
+        )
+        self.speed_slider.set(200)  # Default to 200 milliseconds
+        self.speed_slider.pack(side="left", fill="x", expand=True, padx=5)
+
+        self.speed_value_label = ctk.CTkLabel(self.speed_frame, text="200 ms/frame")
+        self.speed_value_label.pack(side="left", padx=5)
+
+        # Circular Crop Checkbox
+        self.circular_crop_checkbox = ctk.CTkCheckBox(
+            self,
+            text="Apply Circular Crop",
+            variable=self.apply_circular_crop,
+        )
+        self.circular_crop_checkbox.pack(pady=5)
+
+        # Text Overlay Entry
+        self.text_overlay_frame = ctk.CTkFrame(self, fg_color="#212121")
+        self.text_overlay_frame.pack(pady=5, fill="x")
+
+        self.text_overlay_label = ctk.CTkLabel(self.text_overlay_frame, text="Text Overlay:")
+        self.text_overlay_label.pack(side="left", padx=5)
+
+        self.text_overlay_entry = ctk.CTkEntry(
+            self.text_overlay_frame,
+            textvariable=self.text_overlay,
+            width=200,
+        )
+        self.text_overlay_entry.pack(side="left", padx=5)
+
+        # Font Color Button
+        self.font_color_button = ctk.CTkButton(
+            self.text_overlay_frame,
+            text="Font Color",
+            command=self.choose_font_color,
+        )
+        self.font_color_button.pack(side="left", padx=5)
+
+        # Font Size Entry
+        self.font_size_label = ctk.CTkLabel(self.text_overlay_frame, text="Font Size:")
+        self.font_size_label.pack(side="left", padx=5)
+
+        self.font_size_entry = ctk.CTkEntry(
+            self.text_overlay_frame,
+            textvariable=self.font_size,
+            width=50,
+        )
+        self.font_size_entry.pack(side="left", padx=5)
+
+        # Preview Button
+        self.preview_button = ctk.CTkButton(
+            self,
+            text="Preview",
+            command=self.preview_gif,
+        )
+        self.preview_button.pack(pady=5)
+
+        # GIF Preview Area
+        self.preview_canvas = tk.Canvas(self, width=400, height=400, bg="black")
+        self.preview_canvas.pack(pady=10)
+
+        # Bind mouse events for text overlay
+        self.preview_canvas.bind("<ButtonPress-1>", self.start_move_text)
+        self.preview_canvas.bind("<B1-Motion>", self.move_text)
+        self.preview_canvas.bind("<ButtonRelease-1>", self.end_move_text)
+
+        # Download and Clear Buttons Frame
+        self.button_frame = ctk.CTkFrame(self, fg_color="#212121")
+        self.button_frame.pack(pady=5, fill="x")
+
+        # Download Button
+        self.download_button = ctk.CTkButton(
+            self.button_frame,
+            text="Download",
+            command=self.download_gif,
+            state="disabled",
+        )
+        self.download_button.pack(side="left", padx=5)
+
+        # Clear All Button
+        self.clear_button = ctk.CTkButton(
+            self.button_frame,
+            text="Clear All",
+            command=self.clear_all,
+            fg_color="#f44336",
+        )
+        self.clear_button.pack(side="left", padx=5)
+
+        # Progress Bar
+        self.progress_bar = ctk.CTkProgressBar(
+            self, orientation="horizontal", width=1100
+        )
+        self.progress_bar.pack(pady=10)
+        self.progress_bar.set(0)
+
+        # Status label
+        self.status_label = ctk.CTkLabel(
+            self,
+            text="No GIF created.",
+            wraplength=1100,
+            justify="center",
+        )
+        self.status_label.pack(pady=10)
+
+        # Update text when the text overlay changes
+        self.text_overlay.trace("w", self.update_canvas_text)
+        # Update text when font size changes
+        self.font_size.trace("w", self.update_canvas_text)
+        # Update text when font color changes
+        # self.font_color is updated via choose_font_color method
+
+    def choose_font_color(self):
+        # Open color picker dialog
+        color_code = colorchooser.askcolor(title="Choose Font Color")
+        if color_code:
+            self.font_color = color_code[1]  # Hex color code
+            self.update_canvas_text()
+
+    def update_speed_label(self, value):
+        value = int(float(value))
+        self.frame_duration.set(value / 1000)  # Convert milliseconds to seconds
+        self.speed_value_label.configure(text=f"{value} ms/frame")
+
+    def select_images(self):
+        file_paths = filedialog.askopenfilenames(
+            title="Select Images",
+            filetypes=[
+                ("Image Files", "*.png *.jpg *.jpeg *.bmp *.webp"),
+                ("All Files", "*.*"),
+            ],
+        )
+        if file_paths:
+            self.image_paths = file_paths
+            self.selected_images_label.configure(text=f"{len(file_paths)} images selected")
+        else:
+            self.status_label.configure(text="No images selected.")
+
+    def preview_gif(self):
+        if not self.image_paths:
+            messagebox.showerror("Error", "No images selected!")
+            return
+
+        # Disable the button to prevent multiple clicks
+        self.preview_button.configure(state="disabled")
+
+        # Reset progress bar
+        self.progress_bar.set(0)
+
+        # Start processing in a separate thread
+        threading.Thread(target=self.process_gif_preview, daemon=True).start()
+
+    def process_gif_preview(self):
+        try:
+            self.status_label.configure(text="Creating GIF preview...")
+
+            # Sort images based on filename
+            sorted_images = sorted(self.image_paths, key=lambda x: os.path.basename(x))
+
+            # Get the size of the first image
+            with Image.open(sorted_images[0]) as img:
+                common_size = img.size
+
+            images = []
+            total_images = len(sorted_images)
+            for idx, path in enumerate(sorted_images):
+                with Image.open(path) as img:
+                    # Resize the image to the common size
+                    img = img.resize(common_size, Image.Resampling.LANCZOS)
+
+                    # Apply circular crop if selected
+                    if self.apply_circular_crop.get():
+                        img = self.apply_circular_mask(img)
+
+                    images.append(img.copy())
+
+                # Update progress
+                progress = (idx + 1) / total_images
+                self.progress_bar.set(progress)
+
+                self.status_label.configure(text=f"Processing image {idx + 1}/{total_images}")
+
+            # Save the GIF to a temporary file
+            self.temp_gif_path = os.path.join(tempfile.gettempdir(), f"temp_preview_{int(time.time())}.gif")
+
+            # Use PIL to save the GIF
+            images[0].save(
+                self.temp_gif_path,
+                save_all=True,
+                append_images=images[1:],
+                duration=self.frame_duration.get() * 1000,  # Duration per frame in milliseconds
+                loop=0,
+            )
+
+            # Verify that the file was created
+            if not os.path.exists(self.temp_gif_path):
+                raise FileNotFoundError("Failed to create temporary GIF file.")
+
+            # Update status
+            self.status_label.configure(text="GIF preview created.")
+
+            # Display the GIF
+            self.display_gif_preview()
+
+            # Enable the Download button
+            self.download_button.configure(state="normal")
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to create GIF preview: {e}")
+            traceback.print_exc()
+        finally:
+            # Re-enable the button
+            self.preview_button.configure(state="normal")
+
+    def apply_circular_mask(self, img):
+        # Create a circular mask
+        mask = Image.new('L', img.size, 0)
+        draw = ImageDraw.Draw(mask)
+        width, height = img.size
+        draw.ellipse((0, 0, width, height), fill=255)
+        # Apply mask to the image
+        img.putalpha(mask)
+        # Create a new image with white background
+        bg = Image.new('RGBA', img.size, (255, 255, 255, 255))
+        bg.paste(img, (0, 0), img)
+        return bg.convert('RGB')
+
+    def add_text_overlay(self, img):
+        draw = ImageDraw.Draw(img)
+        text = self.text_overlay.get()
+
+        # Load a font with the selected size.
+        font_path = self.get_font_path()
+        font_size = self.font_size.get()
+        if font_path and os.path.exists(font_path):
+            try:
+                font = ImageFont.truetype(font_path, font_size)
+            except IOError:
+                font = ImageFont.load_default()
+                logging.warning("Specified font not found. Using default font.")
+        else:
+            font = ImageFont.load_default()
+            logging.warning("Font path is invalid. Using default font.")
+
+        # Add text to the image with outline
+        draw.text(
+            (self.text_position[0], self.text_position[1]),
+            text,
+            font=font,
+            fill=self.font_color,
+            stroke_width=2,
+            stroke_fill="black",
+        )
+
+        return img
+
+    def get_font_path(self):
+        # Determine the font path based on the operating system
+        if os.name == 'nt':  # Windows
+            font_dir = "C:\\Windows\\Fonts"
+            possible_fonts = [
+                "Arial.ttf",        # Regular
+                "arial.ttf",
+                "Arialbd.ttf",      # Bold
+                "arialbd.ttf",
+                "Ariali.ttf",       # Italic
+                "ariali.ttf",
+                "Arialbi.ttf",      # Bold Italic
+                "arialbi.ttf",
+                # Add other Arial font files if needed
+            ]
+            for font_name in possible_fonts:
+                font_path = os.path.join(font_dir, font_name)
+                if os.path.exists(font_path):
+                    return font_path
+        elif os.name == 'posix':
+            if platform.system() == 'Darwin':  # macOS
+                font_dir = "/Library/Fonts"
+                possible_fonts = ["Arial.ttf", "Arial Bold.ttf", "Arial Italic.ttf"]
+                for font_name in possible_fonts:
+                    font_path = os.path.join(font_dir, font_name)
+                    if os.path.exists(font_path):
+                        return font_path
+            else:  # Linux
+                font_dir = "/usr/share/fonts/truetype"
+                possible_fonts = [
+                    "arial.ttf",
+                    "Arial.ttf",
+                    "dejavu/DejaVuSans.ttf",  # DejaVu Sans as an alternative
+                ]
+                for font_name in possible_fonts:
+                    font_path = os.path.join(font_dir, font_name)
+                    if os.path.exists(font_path):
+                        return font_path
+        else:
+            font_path = None
+        return font_path  # Return None if no font found
+
+    def display_gif_preview(self):
+        # Load the GIF
+        self.preview_image = Image.open(self.temp_gif_path)
+
+        # Calculate the resized dimensions (25% of original)
+        self.preview_width = int(self.preview_image.width * 0.25)
+        self.preview_height = int(self.preview_image.height * 0.25)
+
+        # Start the animation
+        self.animate_gif(0)
+
+    def animate_gif(self, frame_index):
+        try:
+            self.preview_image.seek(frame_index)
+        except EOFError:
+            frame_index = 0
+            self.preview_image.seek(frame_index)
+
+        frame = self.preview_image.copy()
+
+        # Resize the frame to 25% for preview
+        frame = frame.resize((self.preview_width, self.preview_height), Image.Resampling.LANCZOS)
+
+        # Convert to PhotoImage
+        self.photoimage = ImageTk.PhotoImage(frame)
+        self.preview_canvas.create_image(0, 0, anchor="nw", image=self.photoimage)
+        self.preview_canvas.image = self.photoimage
+
+        # Add text overlay as a canvas item
+        if not hasattr(self, 'text_canvas_item'):
+            font = (self.font_name, self.font_size.get())
+            self.text_canvas_item = self.preview_canvas.create_text(
+                self.text_position[0],
+                self.text_position[1],
+                text=self.text_overlay.get(),
+                fill=self.font_color,
+                font=font,
+                anchor="nw",
+                tags="text_overlay"
+            )
+        else:
+            self.preview_canvas.coords(self.text_canvas_item, self.text_position[0], self.text_position[1])
+            self.preview_canvas.itemconfig(
+                self.text_canvas_item,
+                text=self.text_overlay.get(),
+                fill=self.font_color,
+                font=(self.font_name, self.font_size.get())
+            )
+
+        frame_index += 1
+        self.after(int(self.frame_duration.get() * 1000), lambda: self.animate_gif(frame_index))
+
+    def start_move_text(self, event):
+        self.text_move_start = (event.x, event.y)
+        self.text_item = self.preview_canvas.find_withtag("text_overlay")
+        if not self.text_item:
+            return
+
+    def move_text(self, event):
+        dx = event.x - self.text_move_start[0]
+        dy = event.y - self.text_move_start[1]
+        if self.text_item:
+            self.preview_canvas.move(self.text_item, dx, dy)
+        self.text_move_start = (event.x, event.y)
+
+    def end_move_text(self, event):
+        # Get the current position of the text
+        if self.text_item:
+            coords = self.preview_canvas.coords(self.text_item)
+            self.text_position = [coords[0], coords[1]]
+
+    def update_canvas_text(self, *args):
+        if hasattr(self, 'text_canvas_item'):
+            self.preview_canvas.itemconfig(
+                self.text_canvas_item,
+                text=self.text_overlay.get(),
+                fill=self.font_color,
+                font=(self.font_name, self.font_size.get())
+            )
+
+    def download_gif(self):
+        try:
+            if not hasattr(self, 'temp_gif_path') or not os.path.exists(self.temp_gif_path):
+                messagebox.showerror("Error", "No GIF to download. Please generate a preview first.")
+                return
+
+            # Ask the user for the output folder and filename
+            output_path = filedialog.asksaveasfilename(
+                title="Save GIF",
+                defaultextension=".gif",
+                filetypes=[("GIF Files", "*.gif")],
+            )
+
+            if output_path:
+                # Re-create the GIF with the final text position
+                self.save_final_gif(output_path)
+                messagebox.showinfo("Success", f"GIF saved successfully at {output_path}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save GIF: {e}")
+            traceback.print_exc()
+
+    def save_final_gif(self, output_path):
+        try:
+            # Sort images based on filename
+            sorted_images = sorted(self.image_paths, key=lambda x: os.path.basename(x))
+
+            # Get the size of the first image
+            with Image.open(sorted_images[0]) as img:
+                common_size = img.size
+
+            images = []
+            for path in sorted_images:
+                with Image.open(path) as img:
+                    # Resize the image to the common size
+                    img = img.resize(common_size, Image.Resampling.LANCZOS)
+
+                    # Apply circular crop if selected
+                    if self.apply_circular_crop.get():
+                        img = self.apply_circular_mask(img)
+
+                    # Apply text overlay with final position
+                    if self.text_overlay.get():
+                        img = self.add_text_overlay(img)
+
+                    images.append(img.copy())
+
+            # Save the GIF
+            images[0].save(
+                output_path,
+                save_all=True,
+                append_images=images[1:],
+                duration=self.frame_duration.get() * 1000,
+                loop=0,
+            )
+        except Exception as e:
+            raise e
+
+    def clear_all(self):
+        self.image_paths = []
+        self.frame_duration.set(0.2)
+        self.speed_slider.set(200)
+        self.selected_images_label.configure(text="No images selected")
+        self.preview_canvas.delete("all")
+        if hasattr(self, 'text_canvas_item'):
+            del self.text_canvas_item
+        self.download_button.configure(state="disabled")
+        self.progress_bar.set(0)
+        self.status_label.configure(text="All fields have been cleared.")
+        self.apply_circular_crop.set(False)
+        self.text_overlay.set("")
+        self.text_position = [0, 0]
+        self.font_color = "#FFFFFF"  # Reset to white
+        self.font_size.set(24)  # Reset to default font size
+
+        # Remove the temporary GIF file if it exists
+        if hasattr(self, 'temp_gif_path') and os.path.exists(self.temp_gif_path):
+            os.remove(self.temp_gif_path)
+            del self.temp_gif_path
+
+
+if __name__ == "__main__":
+    try:
+        app = VideoProcessorApp()
+        app.mainloop()
+    except Exception as e:
+        print(f"An error occurred: {e}")
